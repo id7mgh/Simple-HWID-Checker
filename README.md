@@ -1,5 +1,11 @@
 # Simple HWID Checker
 
+This is the public HWID checker fork for id7mgh client. It is a standalone Windows tool and does not contain the private client or build service.
+
+Download `HWIDChecker.exe` from the latest release, open it normally, and copy only the `Hardware Component` value into your account page. The source remains available here under the MIT license.
+
+The checker reads hardware and system identifiers locally to calculate the displayed values. Review the source before running it and do not share the full report if it contains information you do not want to disclose.
+
 The HWID Checker is an easy to use but not so simple hardware identification tool that collects detailed system information using low-level direct hardware access methods. It provides hardware identifiers that are difficult to spoof or modify, making it suitable for secure hardware identification.
 
 ## Code Overview

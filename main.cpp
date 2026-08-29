@@ -5,6 +5,8 @@
 #include <iomanip>
 #include <memory>
 #include <array>
+#include <algorithm>
+#include <cstring>
 #include <Windows.h>
 #include <Iphlpapi.h>
 #include <intrin.h>
@@ -18,7 +20,6 @@
 #include <d3d11.h>
 #include <ntddscsi.h>
 #include <winioctl.h>
-#include <atlbase.h>
 #include <shlwapi.h>
 #include <Wincrypt.h>
 #include <sddl.h>
@@ -89,6 +90,7 @@ extern "C" {
 #pragma comment(lib, "tbs.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ncrypt.lib")
+#pragma comment(lib, "gdi32.lib")
 
 // SMBIOS table access definitions
 #define SMBIOS_HARDWARE_SECURITY 0x25
@@ -1802,7 +1804,7 @@ public:
     }
 };
 
-int main() {
+void LegacyConsoleRun() {
     try {
         HWIDGrabber hwid;
         
@@ -1914,5 +1916,205 @@ int main() {
         std::cerr << "Unknown exception caught!" << std::endl;
     }
     
+}
+
+namespace {
+
+std::string BuildReport() {
+    std::ostringstream output;
+    std::ostringstream errors;
+    std::streambuf* oldOutput = std::cout.rdbuf(output.rdbuf());
+    std::streambuf* oldErrors = std::cerr.rdbuf(errors.rdbuf());
+    LegacyConsoleRun();
+    std::cout.rdbuf(oldOutput);
+    std::cerr.rdbuf(oldErrors);
+    std::string report = output.str();
+    const std::string errorText = errors.str();
+    if (!errorText.empty()) {
+        if (!report.empty()) report += "\n";
+        report += errorText;
+    }
+    return report;
+}
+
+std::wstring WideFromUtf8(const std::string& value) {
+    if (value.empty()) return {};
+    const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+        value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (length <= 0) return L"The checker returned no report.";
+    std::wstring result(static_cast<size_t>(length), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+        static_cast<int>(value.size()), result.data(), length);
+    return result;
+}
+
+std::wstring HardwareComponentFromReport(const std::string& report) {
+    const std::string marker = "Hardware Component:";
+    const size_t markerPosition = report.find(marker);
+    if (markerPosition == std::string::npos) return {};
+    size_t start = markerPosition + marker.size();
+    while (start < report.size() && (report[start] == ' ' || report[start] == '\t')) ++start;
+    size_t end = start;
+    while (end < report.size() && report[end] != '\r' && report[end] != '\n') ++end;
+    return WideFromUtf8(report.substr(start, end - start));
+}
+
+void CopyUnicodeText(HWND owner, const std::wstring& value) {
+    if (!OpenClipboard(owner)) return;
+    EmptyClipboard();
+    const SIZE_T bytes = (value.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) {
+        CloseClipboard();
+        return;
+    }
+    void* destination = GlobalLock(memory);
+    if (!destination) {
+        GlobalFree(memory);
+        CloseClipboard();
+        return;
+    }
+    std::memcpy(destination, value.c_str(), bytes);
+    GlobalUnlock(memory);
+    if (!SetClipboardData(CF_UNICODETEXT, memory)) GlobalFree(memory);
+    CloseClipboard();
+}
+
+enum ControlId : int {
+    kHardwareComponent = 1001,
+    kCopyButton = 1002,
+    kReportEdit = 1003,
+    kStatusText = 1004,
+};
+
+struct GuiState {
+    HWND hardwareEdit = nullptr;
+    HWND reportEdit = nullptr;
+    HWND status = nullptr;
+    std::wstring hardwareComponent;
+};
+
+LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<GuiState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        state = static_cast<GuiState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+
+    switch (message) {
+    case WM_CREATE: {
+        if (!state) return -1;
+        const HFONT font = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        auto control = [&](DWORD exStyle, LPCWSTR className, LPCWSTR text,
+            DWORD style, int id) -> HWND {
+            HWND child = CreateWindowExW(exStyle, className, text,
+                WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, window,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                GetModuleHandleW(nullptr), nullptr);
+            if (child) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            return child;
+        };
+        control(0, L"STATIC",
+            L"Hardware Component (copy this value into your account page):", 0, 0);
+        state->hardwareEdit = control(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP, kHardwareComponent);
+        control(0, L"BUTTON", L"Copy Hardware Component",
+            BS_PUSHBUTTON | WS_TABSTOP, kCopyButton);
+        state->status = control(0, L"STATIC", L"",
+            0, kStatusText);
+        state->reportEdit = control(WS_EX_CLIENTEDGE, L"EDIT", L"",
+            ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL,
+            kReportEdit);
+        return 0;
+    }
+
+    case WM_SIZE: {
+        if (!state) return 0;
+        const int width = LOWORD(lParam);
+        const int height = HIWORD(lParam);
+        const int margin = 16;
+        const int componentHeight = 24;
+        HWND label = GetWindow(window, GW_CHILD);
+        if (label) MoveWindow(label, margin, margin, width - margin * 2, 20, TRUE);
+        if (state->hardwareEdit) MoveWindow(state->hardwareEdit, margin, margin + 24,
+            width - margin * 2 - 190, componentHeight, TRUE);
+        HWND copy = state->hardwareEdit ? GetWindow(state->hardwareEdit, GW_HWNDNEXT) : nullptr;
+        if (copy) MoveWindow(copy, width - margin - 174, margin + 24, 174,
+            componentHeight, TRUE);
+        if (state->status) MoveWindow(state->status, margin, margin + 54,
+            width - margin * 2, 20, TRUE);
+        if (state->reportEdit) MoveWindow(state->reportEdit, margin, margin + 82,
+            width - margin * 2, (std::max)(80, height - margin - (margin + 82)), TRUE);
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (state && LOWORD(wParam) == kCopyButton && HIWORD(wParam) == BN_CLICKED) {
+            CopyUnicodeText(window, state->hardwareComponent);
+            if (state->status) SetWindowTextW(state->status,
+                L"Hardware Component copied.");
+            return 0;
+        }
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+} // namespace
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+    std::string report;
+    try {
+        report = BuildReport();
+    }
+    catch (const std::exception& error) {
+        report = std::string("The checker could not finish.\n\n") + error.what();
+    }
+    catch (...) {
+        report = "The checker could not finish.";
+    }
+
+    static constexpr wchar_t kWindowClass[] = L"Id7mghHwidCheckerWindow";
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.hInstance = instance;
+    windowClass.lpfnWndProc = MainWndProc;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    windowClass.lpszClassName = kWindowClass;
+    if (!RegisterClassExW(&windowClass)) return 1;
+
+    GuiState state;
+    state.hardwareComponent = HardwareComponentFromReport(report);
+    HWND window = CreateWindowExW(0, kWindowClass, L"HWID Checker",
+        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 760, 640,
+        nullptr, nullptr, instance, &state);
+    if (!window) return 1;
+    ShowWindow(window, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
+    UpdateWindow(window);
+
+    if (state.hardwareEdit) SetWindowTextW(state.hardwareEdit,
+        state.hardwareComponent.c_str());
+    if (state.reportEdit) {
+        const std::wstring reportText = WideFromUtf8(report);
+        SetWindowTextW(state.reportEdit, reportText.c_str());
+    }
+    if (state.hardwareComponent.empty() && state.status) {
+        SetWindowTextW(state.status,
+            L"The Hardware Component value was not found in the report.");
+    }
+
+    MSG message{};
+    while (true) {
+        const BOOL result = GetMessageW(&message, nullptr, 0, 0);
+        if (result <= 0) break;
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
     return 0;
-} 
+}
