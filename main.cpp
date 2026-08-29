@@ -7,6 +7,7 @@
 #include <array>
 #include <algorithm>
 #include <cstring>
+#include <cstdint>
 #include <Windows.h>
 #include <Iphlpapi.h>
 #include <intrin.h>
@@ -90,7 +91,6 @@ extern "C" {
 #pragma comment(lib, "tbs.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ncrypt.lib")
-#pragma comment(lib, "gdi32.lib")
 
 // SMBIOS table access definitions
 #define SMBIOS_HARDWARE_SECURITY 0x25
@@ -1980,6 +1980,115 @@ void CopyUnicodeText(HWND owner, const std::wstring& value) {
     CloseClipboard();
 }
 
+std::string ReadMachineGuid() {
+    HKEY key = nullptr;
+    const REGSAM access = KEY_READ | KEY_WOW64_64KEY;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Cryptography",
+        0, access, &key) != ERROR_SUCCESS) {
+        return {};
+    }
+
+    DWORD type = 0;
+    DWORD size = 0;
+    if (RegQueryValueExA(key, "MachineGuid", nullptr, &type, nullptr, &size) != ERROR_SUCCESS ||
+        (type != REG_SZ && type != REG_EXPAND_SZ) || size == 0 || size > 512) {
+        RegCloseKey(key);
+        return {};
+    }
+
+    std::string value(size, '\0');
+    const LONG result = RegQueryValueExA(key, "MachineGuid", nullptr, &type,
+        reinterpret_cast<LPBYTE>(value.data()), &size);
+    RegCloseKey(key);
+    if (result != ERROR_SUCCESS) return {};
+    while (!value.empty() && value.back() == '\0') value.pop_back();
+    return value;
+}
+
+std::string CpuMaterial() {
+    int registers[4] = { 0, 0, 0, 0 };
+    std::ostringstream output;
+
+    __cpuid(registers, 0);
+    const unsigned int highestBasicLeaf = static_cast<unsigned int>(registers[0]);
+    output << std::hex << std::uppercase;
+    if (highestBasicLeaf >= 1) {
+        __cpuid(registers, 1);
+        output << registers[0] << ':' << registers[2] << ':' << registers[3];
+    }
+
+    __cpuid(registers, 0x80000000);
+    const unsigned int highestExtendedLeaf = static_cast<unsigned int>(registers[0]);
+    if (highestExtendedLeaf >= 0x80000004) {
+        for (unsigned int leaf = 0x80000002; leaf <= 0x80000004; ++leaf) {
+            __cpuid(registers, static_cast<int>(leaf));
+            output << ':' << registers[0] << ':' << registers[1]
+                << ':' << registers[2] << ':' << registers[3];
+        }
+    }
+    return output.str();
+}
+
+std::string StableHwidMaterial() {
+    std::ostringstream material;
+    material << "id7mgh-hwid-v2|";
+
+    const std::string machineGuid = ReadMachineGuid();
+    if (!machineGuid.empty()) material << "machine=" << machineGuid << '|';
+
+    char computerName[MAX_COMPUTERNAME_LENGTH + 1] = { 0 };
+    DWORD computerNameLength = MAX_COMPUTERNAME_LENGTH + 1;
+    if (GetComputerNameA(computerName, &computerNameLength)) {
+        material << "computer=" << computerName << '|';
+    }
+
+    DWORD volumeSerial = 0;
+    if (GetVolumeInformationA("C:\\", nullptr, 0, &volumeSerial, nullptr,
+        nullptr, nullptr, 0)) {
+        material << "volume=" << std::hex << volumeSerial << '|';
+    }
+
+    material << "cpu=" << CpuMaterial();
+    return material.str();
+}
+
+std::uint64_t FallbackDigest(const std::string& value) {
+    std::uint64_t digest = 14695981039346656037ull;
+    for (const unsigned char character : value) {
+        digest ^= character;
+        digest *= 1099511628211ull;
+    }
+    return digest;
+}
+
+std::uint64_t DigestPrefixToInteger(const std::string& digest, const std::string& material) {
+    std::uint64_t value = 0;
+    size_t digits = 0;
+    for (const char character : digest) {
+        unsigned int nibble = 0;
+        if (character >= '0' && character <= '9') nibble = character - '0';
+        else if (character >= 'a' && character <= 'f') nibble = character - 'a' + 10;
+        else if (character >= 'A' && character <= 'F') nibble = character - 'A' + 10;
+        else continue;
+        value = (value << 4) | nibble;
+        if (++digits == 16) return value;
+    }
+    return FallbackDigest(material);
+}
+
+std::string GenerateShortHwid() {
+    const std::string material = StableHwidMaterial();
+    const std::string digest = HWIDGrabber{}.HashString(material);
+    std::uint64_t value = DigestPrefixToInteger(digest, material);
+    static constexpr char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    std::string shortHwid(7, alphabet[0]);
+    for (int index = static_cast<int>(shortHwid.size()) - 1; index >= 0; --index) {
+        shortHwid[static_cast<size_t>(index)] = alphabet[value % 36];
+        value /= 36;
+    }
+    return shortHwid;
+}
+
 enum ControlId : int {
     kHardwareComponent = 1001,
     kCopyButton = 1002,
@@ -2016,10 +2125,10 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
             return child;
         };
         control(0, L"STATIC",
-            L"Hardware Component (copy this value into your account page):", 0, 0);
+            L"HWID", 0, 0);
         state->hardwareEdit = control(WS_EX_CLIENTEDGE, L"EDIT", L"",
             ES_READONLY | ES_AUTOHSCROLL | WS_TABSTOP, kHardwareComponent);
-        control(0, L"BUTTON", L"Copy Hardware Component",
+        control(0, L"BUTTON", L"Copy HWID",
             BS_PUSHBUTTON | WS_TABSTOP, kCopyButton);
         state->status = control(0, L"STATIC", L"",
             0, kStatusText);
@@ -2053,7 +2162,7 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
         if (state && LOWORD(wParam) == kCopyButton && HIWORD(wParam) == BN_CLICKED) {
             CopyUnicodeText(window, state->hardwareComponent);
             if (state->status) SetWindowTextW(state->status,
-                L"Hardware Component copied.");
+                L"HWID copied.");
             return 0;
         }
         break;
@@ -2067,54 +2176,23 @@ LRESULT CALLBACK MainWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lP
 
 } // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
-    std::string report;
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+    std::string shortHwid;
     try {
-        report = BuildReport();
-    }
-    catch (const std::exception& error) {
-        report = std::string("The checker could not finish.\n\n") + error.what();
+        shortHwid = GenerateShortHwid();
     }
     catch (...) {
-        report = "The checker could not finish.";
+        shortHwid.clear();
     }
 
-    static constexpr wchar_t kWindowClass[] = L"Id7mghHwidCheckerWindow";
-    WNDCLASSEXW windowClass{};
-    windowClass.cbSize = sizeof(windowClass);
-    windowClass.hInstance = instance;
-    windowClass.lpfnWndProc = MainWndProc;
-    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
-    windowClass.lpszClassName = kWindowClass;
-    if (!RegisterClassExW(&windowClass)) return 1;
-
-    GuiState state;
-    state.hardwareComponent = HardwareComponentFromReport(report);
-    HWND window = CreateWindowExW(0, kWindowClass, L"HWID Checker",
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 760, 640,
-        nullptr, nullptr, instance, &state);
-    if (!window) return 1;
-    ShowWindow(window, showCommand == SW_HIDE ? SW_SHOWNORMAL : showCommand);
-    UpdateWindow(window);
-
-    if (state.hardwareEdit) SetWindowTextW(state.hardwareEdit,
-        state.hardwareComponent.c_str());
-    if (state.reportEdit) {
-        const std::wstring reportText = WideFromUtf8(report);
-        SetWindowTextW(state.reportEdit, reportText.c_str());
-    }
-    if (state.hardwareComponent.empty() && state.status) {
-        SetWindowTextW(state.status,
-            L"The Hardware Component value was not found in the report.");
+    if (shortHwid.empty()) {
+        MessageBoxW(nullptr, L"Could not generate your HWID.", L"HWID Checker",
+            MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        return 1;
     }
 
-    MSG message{};
-    while (true) {
-        const BOOL result = GetMessageW(&message, nullptr, 0, 0);
-        if (result <= 0) break;
-        TranslateMessage(&message);
-        DispatchMessageW(&message);
-    }
+    CopyUnicodeText(nullptr, WideFromUtf8(shortHwid));
+    MessageBoxW(nullptr, L"Your HWID is copied", L"HWID Checker",
+        MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
     return 0;
 }
