@@ -2,7 +2,7 @@
 
 This is a small public Windows utility. It calculates a stable seven-character HWID locally, copies the value to the clipboard, and shows a confirmation popup.
 
-The checker does not open a console window, display a hardware report, or collect memory/free-space details for display. The generated value is an opaque identifier such as `y8t3whd`.
+The checker does not open a console window or display a hardware report. The generated value is an opaque identifier such as `y8t3whd`.
 
 Download the latest `HWIDChecker.exe` from [Releases](https://github.com/id7mgh/Simple-HWID-Checker/releases/latest), or build it from `main.cpp` with Visual Studio 2022 and the Windows SDK.
 
