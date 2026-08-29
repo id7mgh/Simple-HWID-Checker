@@ -9,6 +9,7 @@
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "user32.lib")
 
 namespace {
@@ -209,6 +210,174 @@ bool CopyUnicodeText(const std::wstring& value) {
     return true;
 }
 
+enum PopupControlId : int {
+    kPopupOkButton = 1001,
+};
+
+struct PopupState {
+    bool copied = false;
+    HWND okButton = nullptr;
+};
+
+HBRUSH PopupBackgroundBrush() {
+    static HBRUSH brush = CreateSolidBrush(RGB(15, 18, 26));
+    return brush;
+}
+
+HBRUSH PopupButtonBrush() {
+    static HBRUSH brush = CreateSolidBrush(RGB(0, 102, 204));
+    return brush;
+}
+
+HFONT PopupFont(int height, bool bold) {
+    return CreateFontW(height, 0, 0, 0, bold ? FW_SEMIBOLD : FW_NORMAL,
+        FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+        L"Segoe UI");
+}
+
+void DrawPopupText(HDC deviceContext, const wchar_t* text, RECT rect,
+    HFONT font, COLORREF color, UINT format) {
+    const HGDIOBJ oldFont = SelectObject(deviceContext, font);
+    SetBkMode(deviceContext, TRANSPARENT);
+    SetTextColor(deviceContext, color);
+    DrawTextW(deviceContext, text, -1, &rect, format);
+    SelectObject(deviceContext, oldFont);
+}
+
+LRESULT CALLBACK PopupWndProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    auto* state = reinterpret_cast<PopupState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        state = static_cast<PopupState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+    }
+
+    switch (message) {
+    case WM_CREATE:
+        if (!state) return -1;
+        state->okButton = CreateWindowExW(0, L"BUTTON", L"OK",
+            WS_CHILD | WS_VISIBLE | BS_OWNERDRAW | WS_TABSTOP,
+            0, 0, 0, 0, window,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kPopupOkButton)),
+            GetModuleHandleW(nullptr), nullptr);
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_SIZE:
+        if (state && state->okButton) {
+            const int width = LOWORD(lParam);
+            const int height = HIWORD(lParam);
+            MoveWindow(state->okButton, width - 102, height - 46, 78, 30, TRUE);
+        }
+        return 0;
+
+    case WM_CTLCOLORBTN:
+        SetTextColor(reinterpret_cast<HDC>(wParam), RGB(255, 255, 255));
+        SetBkColor(reinterpret_cast<HDC>(wParam), RGB(0, 102, 204));
+        return reinterpret_cast<LRESULT>(PopupButtonBrush());
+
+    case WM_DRAWITEM: {
+        const auto* draw = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (!draw || draw->CtlID != kPopupOkButton) break;
+        FillRect(draw->hDC, &draw->rcItem, PopupButtonBrush());
+        RECT textRect = draw->rcItem;
+        DrawPopupText(draw->hDC, L"OK", textRect, PopupFont(-14, true),
+            RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return TRUE;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == kPopupOkButton && HIWORD(wParam) == BN_CLICKED) {
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+
+    case WM_LBUTTONDOWN:
+        if (HIWORD(lParam) < 38) {
+            ReleaseCapture();
+            SendMessageW(window, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+            return 0;
+        }
+        break;
+
+    case WM_PAINT: {
+        PAINTSTRUCT paint{};
+        HDC deviceContext = BeginPaint(window, &paint);
+        RECT client{};
+        GetClientRect(window, &client);
+        FillRect(deviceContext, &client, PopupBackgroundBrush());
+
+        RECT title = { 18, 8, client.right - 18, 32 };
+        DrawPopupText(deviceContext, L"id7mgh client", title, PopupFont(-17, true),
+            RGB(235, 241, 250), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT accent = { 18, 38, client.right - 18, 40 };
+        FillRect(deviceContext, &accent, PopupButtonBrush());
+
+        RECT messageRect = { 18, 61, client.right - 18, 105 };
+        DrawPopupText(deviceContext,
+            state && state->copied ? L"Your HWID is copied" : L"Could not copy your HWID",
+            messageRect, PopupFont(-19, false),
+            state && state->copied ? RGB(235, 241, 250) : RGB(255, 130, 130),
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        EndPaint(window, &paint);
+        return 0;
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(window);
+        return 0;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+int ShowPopup(bool copied) {
+    static constexpr wchar_t kWindowClass[] = L"Id7mghHwidCheckerPopup";
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    WNDCLASSEXW windowClass{};
+    windowClass.cbSize = sizeof(windowClass);
+    windowClass.hInstance = instance;
+    windowClass.lpfnWndProc = PopupWndProc;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hbrBackground = PopupBackgroundBrush();
+    windowClass.lpszClassName = kWindowClass;
+    if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return 1;
+    }
+
+    PopupState state;
+    state.copied = copied;
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_DLGMODALFRAME,
+        kWindowClass, L"id7mgh client", WS_POPUP | WS_BORDER,
+        CW_USEDEFAULT, CW_USEDEFAULT, 420, 170,
+        nullptr, nullptr, instance, &state);
+    if (!window) return 1;
+
+    RECT workArea{};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+    const int width = 420;
+    const int height = 170;
+    const int x = workArea.left + ((workArea.right - workArea.left) - width) / 2;
+    const int y = workArea.top + ((workArea.bottom - workArea.top) - height) / 2;
+    SetWindowPos(window, HWND_TOP, x, y, width, height, SWP_SHOWWINDOW);
+    UpdateWindow(window);
+    if (state.okButton) SetFocus(state.okButton);
+
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    return copied ? 0 : 1;
+}
+
 } // namespace
 
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
@@ -220,15 +389,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         shortHwid.clear();
     }
 
-    if (shortHwid.empty()) {
-        MessageBoxW(nullptr, L"Could not generate your HWID.", L"HWID Checker",
-            MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
-        return 1;
-    }
-
-    const bool copied = CopyUnicodeText(std::wstring(shortHwid.begin(), shortHwid.end()));
-    MessageBoxW(nullptr, copied ? L"Your HWID is copied" : L"Could not copy your HWID",
-        L"HWID Checker", MB_OK | (copied ? MB_ICONINFORMATION : MB_ICONERROR) |
-        MB_SETFOREGROUND);
-    return copied ? 0 : 1;
+    const bool copied = !shortHwid.empty() &&
+        CopyUnicodeText(std::wstring(shortHwid.begin(), shortHwid.end()));
+    return ShowPopup(copied);
 }
